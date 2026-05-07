@@ -14,7 +14,7 @@ interface ParsedWorkbook {
   warnings: string[]
 }
 
-const EXPECTED_SHEETS = ['Vessel Ullage', 'Sounding Barge', 'Time Log', 'Sample Report', 'Letter of Protest']
+const REQUIRED_SHEETS = ['Vessel Ullage', 'Sounding Barge', 'Time Log', 'Sample Report']
 const GRADES = new Set<TankRow['grade']>(['VLSFO', 'LSMGO', 'HFO', 'MDO'])
 
 function normalizeCellValue(value: ExcelJS.CellValue): CellValue {
@@ -43,6 +43,15 @@ function rowsFromSheet(workbook: ExcelJS.Workbook, sheetName: string): SheetRows
     rows[rowNumber - 1] = values
   })
   return rows
+}
+
+function findSheetName(workbook: ExcelJS.Workbook, wantedName: string): string | null {
+  const normalizedWanted = wantedName.toLowerCase()
+  const exact = workbook.worksheets.find((sheet) => sheet.name.toLowerCase() === normalizedWanted)
+  if (exact) return exact.name
+
+  const prefix = workbook.worksheets.find((sheet) => sheet.name.toLowerCase().startsWith(normalizedWanted))
+  return prefix?.name ?? null
 }
 
 function text(value: CellValue): string {
@@ -77,6 +86,13 @@ function findRow(rows: SheetRows, label: string, startAt = 1): number | null {
     if (rows[r]?.some((value) => text(value).toLowerCase().includes(needle))) return r + 1
   }
   return null
+}
+
+function findCol(rows: SheetRows, row: number, label: string, fallback: number): number {
+  const needle = label.toLowerCase()
+  const values = rows[row - 1] || []
+  const index = values.findIndex((value) => text(value).toLowerCase().includes(needle))
+  return index >= 0 ? index + 1 : fallback
 }
 
 function excelSerialToDate(serial: number): Date {
@@ -154,10 +170,11 @@ function parseTankBlock(
     options.warnings.push(`${options.context}: tank header not found.`)
     return []
   }
+  const firstCol = findCol(rows, header, 'tank', options.firstCol)
 
   const tanks: TankRow[] = []
   for (let row = header + 2; row <= rows.length; row++) {
-    const tankName = cellText(rows, row, options.firstCol)
+    const tankName = cellText(rows, row, firstCol)
     const firstCell = tankName.toLowerCase()
     if (firstCell === 'total' || firstCell.includes('after ') || firstCell.includes('before ')) break
     if (!tankName) {
@@ -166,20 +183,29 @@ function parseTankBlock(
       continue
     }
 
-    const totalVol = cellNumber(rows, row, options.firstCol + 4)
-    const freeWaterVol = cellNumber(rows, row, options.firstCol + 6)
+    const totalVol = cellNumber(rows, row, firstCol + 4)
+    const freeWaterVol = cellNumber(rows, row, firstCol + 6)
+    const spreadsheetGrossObs = numberValue(cell(rows, row, firstCol + 7))
+    const spreadsheetGrossStd = numberValue(cell(rows, row, firstCol + 10))
+    const spreadsheetInVac = numberValue(cell(rows, row, firstCol + 11))
+    const spreadsheetInAir = numberValue(cell(rows, row, firstCol + 12))
     const rowData = calcTankRow({
       tank_name: tankName,
-      grade: normalizeGrade(cell(rows, row, options.firstCol + 1), options.warnings, `${options.context} row ${row}`),
-      sounding_type: soundingType(cell(rows, row, options.firstCol + 2)),
-      sounding_value: cellNumber(rows, row, options.firstCol + 2),
-      deg: cellNumber(rows, row, options.firstCol + 3),
+      grade: normalizeGrade(cell(rows, row, firstCol + 1), options.warnings, `${options.context} row ${row}`),
+      sounding_type: soundingType(cell(rows, row, firstCol + 2)),
+      sounding_value: cellNumber(rows, row, firstCol + 2),
+      deg: cellNumber(rows, row, firstCol + 3),
       total_vol_observed: totalVol,
-      free_water_dip: cellText(rows, row, options.firstCol + 5) || 'Nil',
+      free_water_dip: cellText(rows, row, firstCol + 5) || 'Nil',
       free_water_vol: freeWaterVol,
-      vcf_tab_54b: cellNumber(rows, row, options.firstCol + 8),
-      density_sg: cellNumber(rows, row, options.firstCol + 9),
+      vcf_tab_54b: cellNumber(rows, row, firstCol + 8),
+      density_sg: cellNumber(rows, row, firstCol + 9),
     })
+    if (spreadsheetGrossObs !== undefined) rowData.gross_obs_vol = spreadsheetGrossObs
+    if (spreadsheetGrossStd !== undefined) rowData.gross_std_vol = spreadsheetGrossStd
+    if (spreadsheetInVac !== undefined) rowData.in_vac = spreadsheetInVac
+    if (spreadsheetInAir !== undefined) rowData.in_air = spreadsheetInAir
+    if (!rowData.total_vol_observed && !rowData.gross_std_vol && /^(\d+)?$/.test(tankName.trim())) continue
     tanks.push(rowData)
   }
 
@@ -197,14 +223,16 @@ export async function parseBqsWorkbook(buffer: Buffer): Promise<ParsedWorkbook> 
   const workbook = new ExcelJS.Workbook()
   await workbook.xlsx.load(buffer as unknown as ArrayBuffer)
   const sheetNames = workbook.worksheets.map((sheet) => sheet.name)
-  const missing = EXPECTED_SHEETS.filter((sheet) => !sheetNames.includes(sheet))
+  const missing = REQUIRED_SHEETS.filter((sheet) => !sheetNames.includes(sheet))
   if (missing.length > 0) throw new Error(`Invalid BQS template. Missing sheet(s): ${missing.join(', ')}`)
+  const protestSheetName = findSheetName(workbook, 'Letter of Protest')
+  if (!protestSheetName) warnings.push('Letter of Protest sheet was not found; protest fields need review.')
 
   const vesselRows = rowsFromSheet(workbook, 'Vessel Ullage')
   const bargeRows = rowsFromSheet(workbook, 'Sounding Barge')
   const timeRows = rowsFromSheet(workbook, 'Time Log')
   const sampleRows = rowsFromSheet(workbook, 'Sample Report')
-  const protestRows = rowsFromSheet(workbook, 'Letter of Protest')
+  const protestRows = protestSheetName ? rowsFromSheet(workbook, protestSheetName) : []
 
   const vesselName = cellText(vesselRows, 8, 3) || cellText(bargeRows, 9, 4) || 'Imported Vessel'
   const port = cellText(vesselRows, 9, 9) || cellText(bargeRows, 10, 10)
@@ -219,7 +247,7 @@ export async function parseBqsWorkbook(buffer: Buffer): Promise<ParsedWorkbook> 
   })
   const vesselClose = parseTankBlock(vesselRows, {
     startLabel: 'AFTER BUNKERING',
-    startAt: 40,
+    startAt: 30,
     firstCol: 1,
     warnings,
     context: 'Vessel closing',
@@ -232,7 +260,7 @@ export async function parseBqsWorkbook(buffer: Buffer): Promise<ParsedWorkbook> 
   })
   const bargeClose = parseTankBlock(bargeRows, {
     startLabel: 'AFTER RECEIVING',
-    startAt: 35,
+    startAt: 25,
     firstCol: 2,
     warnings,
     context: 'Barge closing',
